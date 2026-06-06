@@ -254,10 +254,10 @@ proc handleStat(fd: cint; tr: var TagReader; cmdTag: uint32) =
 
 proc handleGetServerInfo(fd: cint; tr: var TagReader; cmdTag: uint32) =
   var reply = initWriter()
-  reply.putString("jack-pulse")          # server_name
-  reply.putString("7.0")                 # server_version
-  reply.putString("jack-pulse")          # user_name
-  reply.putString("linux")               # host_name (before sample_spec!)
+  reply.putString("PulseAudio (on JACK 1.9.22)")  # server_name
+  reply.putString("7.0")                           # server_version
+  reply.putString("jack-pulse")                    # user_name
+  reply.putString("linux")                         # host_name (before sample_spec!)
   reply.putSampleSpec(PA_SAMPLE_S16LE.uint8, 2, 44100)  # default sample spec
   reply.putString("jack-pulse")          # default sink
   reply.putString("jack-pulse")          # default source
