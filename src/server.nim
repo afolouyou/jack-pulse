@@ -1,5 +1,6 @@
 import std/[logging, strformat, os, posix, times, strutils]
 import protocol
+import jacket
 import jack_client
 
 type
@@ -254,7 +255,9 @@ proc handleStat(fd: cint; tr: var TagReader; cmdTag: uint32) =
 
 proc handleGetServerInfo(fd: cint; tr: var TagReader; cmdTag: uint32) =
   var reply = initWriter()
-  reply.putString("PulseAudio (on JACK 1.9.22)")  # server_name
+  let jackVer = $getVersionString()
+  echo "JACK version: ", jackVer
+  reply.putString("PulseAudio (on JACK " & jackVer & ")")  # server_name
   reply.putString("7.0")                           # server_version
   reply.putString("jack-pulse")                    # user_name
   reply.putString("linux")                         # host_name (before sample_spec!)
