@@ -1,7 +1,7 @@
 import std/endians
 
 const
-  PA_PROTOCOL_VERSION* = 13
+  PA_PROTOCOL_VERSION* = 13  # since 2013
   PA_NATIVE_COOKIE_LENGTH* = 256
   FRAME_SIZE_MAX_ALLOW* = 1024 * 1024 * 16
 

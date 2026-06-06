@@ -2,6 +2,7 @@ import std/[logging, strformat, os, posix, times, strutils]
 import protocol
 import jacket
 import jack_client
+import ringbuffer
 
 type
   Client* = object
@@ -150,9 +151,9 @@ proc handleCreatePlaybackStream(fd: cint; tr: var TagReader; cmdTag: uint32) =
   let sinkName = tr.getString()
   let maxLength = tr.getU32()
   let corked = tr.getBoolean()
-  let tlength = tr.getU32()
-  let prebuf = tr.getU32()
-  let minreq = tr.getU32()
+  let tlengthRaw = tr.getU32()
+  let prebufRaw = tr.getU32()
+  let minreqRaw = tr.getU32()
   let syncid = tr.getU32()
   let vol = tr.getCvolume()
 
@@ -172,7 +173,6 @@ proc handleCreatePlaybackStream(fd: cint; tr: var TagReader; cmdTag: uint32) =
     discard tr.getBoolean()  # adjust_latency
     discard tr.getTag()  # proplist tag 'P' - skip entire proplist by reading to end
 
-  # Get client name from the client object
   let clientName = clients[idx].name
 
   let streamId = nextStreamId
@@ -182,26 +182,44 @@ proc handleCreatePlaybackStream(fd: cint; tr: var TagReader; cmdTag: uint32) =
     sendError(fd, cmdTag, ERR_NOTIMPLEMENTED)
     return
 
+  # Store sample spec on the stream for deinterleave
+  for st in mitems(jack.streams):
+    if st.id == streamId:
+      st.sampleChannels = ss.ch
+      st.sampleRate = ss.rate
+      break
+
   clients[idx].streams.add(streamId)
+
+  # Replace INVALID_INDEX with sensible defaults
+  let defaultTlength = 65536'u32
+  let defaultMinreq = 16384'u32
+  let defaultPrebuf = 65536'u32
+  let defaultMaxlen = 131072'u32
+
+  let actualMaxlen = if maxLength == PA_INVALID_INDEX: defaultMaxlen else: maxLength
+  let actualTlength = if tlengthRaw == PA_INVALID_INDEX: defaultTlength else: tlengthRaw
+  let actualPrebuf = if prebufRaw == PA_INVALID_INDEX: defaultPrebuf else: prebufRaw
+  let actualMinreq = if minreqRaw == PA_INVALID_INDEX: defaultMinreq else: minreqRaw
 
   # Build reply for version 13
   var reply = initWriter()
-  reply.putU32(streamId)           # stream_index
-  reply.putU32(streamId)           # sink_input_index (same)
-  reply.putU32(0)                  # missing (initial bytes)
+  reply.putU32(streamId)              # stream_index
+  reply.putU32(streamId)              # sink_input_index (same)
+  reply.putU32(actualTlength)         # missing (tell client how much to send)
   # v9+ buffer attrs
-  reply.putU32(maxLength)          # maxlength
-  reply.putU32(tlength)           # tlength
-  reply.putU32(prebuf)            # prebuf
-  reply.putU32(minreq)            # minreq
+  reply.putU32(actualMaxlen)          # maxlength
+  reply.putU32(actualTlength)         # tlength
+  reply.putU32(actualPrebuf)          # prebuf
+  reply.putU32(actualMinreq)          # minreq
   # v12+ sample spec, channel map, sink info
   reply.putSampleSpec(ss.fmt, ss.ch, ss.rate)
   reply.putChannelMap(cm)
-  reply.putU32(0)                  # sink_index (our dummy)
-  reply.putString("jack-pulse")   # sink_name
-  reply.putBoolean(false)         # suspended
+  reply.putU32(0)                     # sink_index (our dummy)
+  reply.putString("jack-pulse")       # sink_name
+  reply.putBoolean(false)             # suspended
   # v13+ configured_sink_latency
-  reply.putUsec(0)                # 0 latency
+  reply.putUsec(0)                    # 0 latency
 
   sendReply(fd, cmdTag, reply)
 
@@ -210,34 +228,50 @@ proc handleDrainPlaybackStream(fd: cint; tr: var TagReader; cmdTag: uint32) =
   sendSimpleReply(fd, cmdTag)
 
 proc handleGetPlaybackLatency(fd: cint; tr: var TagReader; cmdTag: uint32) =
-  let idx = tr.getU32()
+  let sId = tr.getU32()
   let reqTv = tr.getTimeval()
+
+  # Compute actual latency from ring buffer fill
+  var sinkUsec: uint64 = 0
+  var playing = false
+  for st in mitems(jack.streams):
+    if st.id == sId and st.rings.len > 0 and st.rings[0] != nil:
+      let fill = ringAvail(st.rings[0])
+      let rate = if st.sampleRate > 0: st.sampleRate.uint64 else: 48000'u64
+      sinkUsec = (fill.uint64 * 1_000_000'u64) div rate
+      playing = not st.corked and st.active
+      break
 
   let nowEpoch = epochTime()
   let sec = int(nowEpoch).uint32
   let usec = int((nowEpoch - float(int(nowEpoch))) * 1_000_000).uint32
 
   var reply = initWriter()
-  reply.putUsec(0)             # sink_usec
-  reply.putUsec(0)             # source_usec
-  reply.putBoolean(false)      # playing
+  reply.putUsec(sinkUsec)          # sink_usec
+  reply.putUsec(0)                 # source_usec
+  reply.putBoolean(playing)        # playing
   reply.putTimeval(reqTv.sec, reqTv.usec)  # requested timestamp
-  reply.putTimeval(sec, usec)  # now
-  reply.putS64(0)              # write_index
-  reply.putS64(0)              # read_index
+  reply.putTimeval(sec, usec)      # now
+  reply.putS64(0)                  # write_index
+  reply.putS64(0)                  # read_index
   # v13+
-  reply.putU64(0)              # underrun_for
-  reply.putU64(0)              # playing_for
+  reply.putU64(0)                  # underrun_for
+  reply.putU64(0)                  # playing_for
 
   sendReply(fd, cmdTag, reply)
 
 proc handleFlushPlaybackStream(fd: cint; tr: var TagReader; cmdTag: uint32) =
-  discard tr.getU32()  # stream_id
+  let sId = tr.getU32()  # stream_id
+  jackStreamClear(sId)
   sendSimpleReply(fd, cmdTag)
 
 proc handleCorkPlaybackStream(fd: cint; tr: var TagReader; cmdTag: uint32) =
-  discard tr.getU32()  # stream_id
-  discard tr.getBoolean()  # cork
+  let sId = tr.getU32()   # stream_id
+  let cork = tr.getBoolean()  # cork
+  for st in mitems(jack.streams):
+    if st.id == sId:
+      st.corked = cork
+      break
   sendSimpleReply(fd, cmdTag)
 
 proc handleSubscribe(fd: cint; tr: var TagReader; cmdTag: uint32) =
@@ -337,19 +371,31 @@ proc handleGetSourceInfoList(fd: cint; tr: var TagReader; cmdTag: uint32) =
   sendReply(fd, cmdTag, reply)
 
 proc handleMemblock(fd: cint; streamId: uint32; data: openArray[uint8]) =
-  if data.len == 0: return
-  let nFrames = data.len div 2  # S16LE = 2 bytes per sample
+  if data.len < 2: return
+  let frameSize = 2  # S16LE = 2 bytes per sample
+  let totalSamples = data.len div frameSize
+  if totalSamples == 0: return
+  # Find stream for channel count
+  var nCh = 1'u8
+  for st in mitems(jack.streams):
+    if st.id == streamId and st.sampleChannels > 0:
+      nCh = st.sampleChannels
+      break
+  let nFrames = totalSamples div int(nCh)
   if nFrames == 0: return
-  var tmp: array[8192, float32]
   let maxFrames = min(nFrames, 8192)
+  # Deinterleave: allocate per-channel float32 buffers
+  var chBuf: array[8, array[8192, float32]]
   for i in 0 ..< maxFrames:
-    var sample: int16
-    if i * 2 + 1 < data.len:
-      let lo = data[i * 2].uint16
-      let hi = data[i * 2 + 1].uint16
-      sample = int16((hi shl 8) or lo)
-    tmp[i] = float32(sample) / 32768.0
-  jackWriteAudio(streamId, tmp[0].addr, maxFrames.uint32)
+    for ch in 0 ..< int(nCh):
+      let srcIdx = (i * int(nCh) + ch) * 2
+      if srcIdx + 1 >= data.len: break
+      let lo = data[srcIdx].uint16
+      let hi = data[srcIdx + 1].uint16
+      let sample = int16((hi shl 8) or lo)
+      chBuf[ch][i] = float32(sample) / 32768.0
+  for ch in 0 ..< int(nCh):
+    jackWriteAudio(streamId, ch, chBuf[ch][0].addr, maxFrames.uint32)
 
 proc handleFrame(fd: cint; hdr: FrameHdr; payload: seq[uint8]) =
   echo "handleFrame: channel=", hdr.channel, " payload.len=", payload.len
