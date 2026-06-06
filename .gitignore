@@ -1,0 +1,17 @@
+# Nim
+nimcache/
+nimcache_release/
+*.exe
+*.o
+*.swp
+
+# Build output (binaries)
+jackpulse
+src/jackpulse
+src/server
+src/protocol
+tests/test_server
+
+# OS
+.DS_Store
+Thumbs.db
